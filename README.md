@@ -10,10 +10,12 @@ assumes a fresh `huey` user account and an empty home directory.
 
 **Sources:** this guide was compiled by reading the actual running system
 (systemd units, installed packages, git remotes, config files) on 2026-09-14,
-cross-checked against Hermes's own self-documentation at
-[`jibjabjog/huey-origins`](https://github.com/jibjabjog/huey-origins)
-(README.md + SETUP.md, written earlier the same day). Where the two disagreed,
-this guide follows what's actually on disk and calls out the discrepancy.
+cross-checked against an earlier self-documentation pass Hermes wrote for
+this same repo that same day. Where the two disagreed, this guide follows
+what's actually on disk and calls out the discrepancy — notably, Hermes's
+own write-up described its cron jobs in a way that read like standard OS
+`cron` entries, but they're actually managed by Hermes's internal scheduler
+(see §7). That earlier pass has been superseded by this guide.
 
 > **No secrets in this guide.** Anywhere a real API key, token, or OAuth
 > secret is needed, this guide tells you *where* it goes and *how* to obtain
