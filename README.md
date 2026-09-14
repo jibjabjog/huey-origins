@@ -10,12 +10,10 @@ assumes a fresh `huey` user account and an empty home directory.
 
 **Sources:** this guide was compiled by reading the actual running system
 (systemd units, installed packages, git remotes, config files) on 2026-09-14,
-cross-checked against an earlier self-documentation pass Hermes wrote for
-this same repo that same day. Where the two disagreed, this guide follows
-what's actually on disk and calls out the discrepancy — notably, Hermes's
-own write-up described its cron jobs in a way that read like standard OS
-`cron` entries, but they're actually managed by Hermes's internal scheduler
-(see §7). That earlier pass has been superseded by this guide.
+cross-checked against Hermes's own self-documentation at
+[`jibjabjog/huey-origins`](https://github.com/jibjabjog/huey-origins)
+(README.md + SETUP.md, written earlier the same day). Where the two disagreed,
+this guide follows what's actually on disk and calls out the discrepancy.
 
 > **No secrets in this guide.** Anywhere a real API key, token, or OAuth
 > secret is needed, this guide tells you *where* it goes and *how* to obtain
@@ -57,7 +55,21 @@ own write-up described its cron jobs in a way that read like standard OS
    sudo adduser huey
    sudo usermod -aG sudo huey
    ```
-5. **Enable linger** for `huey` so user-level systemd services keep running
+5. **Give yourself SSH access as `huey`.** `adduser` alone won't let you log
+   in as `huey` — the easiest path is reusing the SSH key already authorized
+   for your current user:
+   ```bash
+   sudo mkdir -p /home/huey/.ssh
+   sudo cp ~/.ssh/authorized_keys /home/huey/.ssh/authorized_keys
+   sudo chown -R huey:huey /home/huey/.ssh
+   sudo chmod 700 /home/huey/.ssh
+   sudo chmod 600 /home/huey/.ssh/authorized_keys
+   ```
+   Then disconnect and reconnect as `huey` (`ssh huey@<instance-ip>`).
+   **Every command in the rest of this guide assumes you're logged in as
+   `huey`, not `ubuntu`** — all the paths (`~/.hermes`, `~/llama.cpp`,
+   `~/models`, the `systemd --user` service) are `huey`'s.
+6. **Enable linger** for `huey` so user-level systemd services keep running
    after you log out and across reboots — this is what lets
    `hermes-gateway.service` run as a headless background service:
    ```bash
@@ -94,6 +106,12 @@ raw pip/venv):
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
+This installs to `~/.local/bin/uv`, which only lands on `PATH` in *new*
+shells. Either start a fresh SSH session, or run `source ~/.bashrc` (or
+`source ~/.local/bin/env`, which the installer also writes) before
+continuing — otherwise `uv --version` in the next step just says
+`command not found`.
+
 ## 3. GitHub CLI + bot account
 
 Hermes uses `gh` to act on GitHub as a dedicated bot account rather than your
@@ -129,8 +147,15 @@ What `setup-hermes.sh` does (worth knowing rather than just trusting):
    NOT have them; scripts and services must reference the venv path
    explicitly: `~/.hermes/hermes-agent/venv/bin/python`. This exact gotcha
    bit the Google Workspace skill on this box — see §8).
-4. Copies `.env.example` → `.env` for you to fill in with real secrets
-   (OpenRouter key, etc. — fill this in by hand, never commit it).
+4. Copies `.env.example` → `.env` for you to fill in with real secrets. The
+   one you need immediately is `OPENROUTER_API_KEY`:
+   - Sign up at [openrouter.ai](https://openrouter.ai), then create a key
+     under **Settings → Keys**.
+   - No payment method is required just to use `openrouter/free`-tagged
+     models (the default this box uses, see below) — you only need billing
+     set up if you later switch to a paid model.
+   - Open `~/.hermes/.env` and set `OPENROUTER_API_KEY=<your key>` by hand.
+     Never commit this file or paste the key anywhere else.
 5. Symlinks a `hermes` command into `~/.local/bin` (make sure that's on your
    `PATH`).
 6. Optionally runs an interactive setup wizard — walks you through picking a
@@ -242,11 +267,31 @@ cmake --build build --config Release -j$(nproc)
 This produces `~/llama.cpp/build/bin/llama-server`.
 
 Download GGUF-quantized models into `~/models/` (sizes chosen for a CPU-only
-24GB-RAM box — quantized, not full precision):
+24GB-RAM box — quantized, not full precision). Ubuntu 24.04's system Python
+blocks unmanaged `pip install`s (PEP 668), so install the Hugging Face CLI
+with the escape hatch this box actually used:
+
+```bash
+pip install -U huggingface_hub --break-system-packages
+```
+
+Then pull the two models this box's own shell history confirms came from
+`unsloth`'s GGUF releases:
+
+```bash
+hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf --local-dir ~/models
+hf download unsloth/Qwen3.5-4B-GGUF   Qwen3.5-4B-Q4_K_M.gguf   --local-dir ~/models
+```
+
 - `Qwen3.5-0.8B-Q4_K_M.gguf` — tiny, used as the actual failover model
   ("Inky")
-- `Qwen3.5-4B-Q4_K_M.gguf`, `Qwen_Qwen3.5-9B-Q6_K_L.gguf` — larger local
-  options, available but not the default failover
+- `Qwen3.5-4B-Q4_K_M.gguf` — a larger local option, available but not the
+  default failover
+- This box also has a `Qwen_Qwen3.5-9B-Q6_K_L.gguf` (9B, Q6_K_L) that isn't
+  required for the failover setup and whose exact source repo wasn't
+  confirmed in this box's history — if you want it, search Hugging Face for
+  a `Qwen3.5-9B` GGUF release using the same naming convention rather than
+  assuming the URL above generalizes.
 - (this box also has some unrelated larger Gemma/Qwen2.5 GGUFs and
   llama.cpp's own vocab test fixtures under `~/models/` — not required for
   the failover setup itself)
@@ -292,9 +337,51 @@ The three Hermes-managed jobs on this box, for reference:
 | local-llama-ping | `*/15 * * * *` | `local_llama_ping.sh` | Telegram |
 | hermes-backup | `0 3 * * *` | `backup_hermes.sh` | local |
 
-Scripts live in `~/.hermes/scripts/`. Set these up as Hermes cron jobs
-through Hermes's own scheduling interface once the agent is running, rather
-than trying to hand-edit `jobs.json`.
+Scripts live in `~/.hermes/scripts/` (see the script-provenance note below —
+they're not part of the upstream `hermes-agent` clone). Register the jobs
+through Hermes's own CLI (`hermes cron create`, aliased `add`) once the
+scripts are in place — don't hand-edit `jobs.json` directly. The exact
+commands that reproduce this box's three jobs:
+
+```bash
+hermes cron create "0 6 * * *" --name "Freerouter" \
+  --script freerouter_failover.sh --no-agent --deliver local
+
+hermes cron create "*/15 * * * *" --name "local-llama-ping" \
+  --script local_llama_ping.sh --no-agent --deliver telegram
+
+hermes cron create "0 3 * * *" --name "hermes-backup" \
+  --script backup_hermes.sh --no-agent --deliver local
+```
+
+`--no-agent` matters here: it means the script's stdout is delivered as-is
+without ever routing through the LLM (a "classic watchdog pattern" per
+`hermes cron create --help`) — appropriate for jobs that are pure
+shell/health-check logic, not reasoning tasks. Confirm registration with
+`hermes cron list`.
+
+**Script provenance — these aren't upstream Hermes files.**
+`freerouter_failover.sh` and `backup_hermes.sh` are bespoke scripts written
+for this deployment; their actual source is kept in the sibling repo
+[`jibjabjog/hermes-config`](https://github.com/jibjabjog/hermes-config),
+which also documents the required env vars
+(`OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_HOME_CHANNEL`) and has
+its own troubleshooting section. Clone it and copy the scripts in:
+
+```bash
+git clone https://github.com/jibjabjog/hermes-config.git ~/.hermes-config
+cp ~/.hermes-config/freerouter_failover.sh ~/.hermes/scripts/
+cp ~/.hermes-config/backup_hermes.sh ~/.hermes/scripts/
+chmod +x ~/.hermes/scripts/freerouter_failover.sh ~/.hermes/scripts/backup_hermes.sh
+```
+
+`local_llama_ping.sh` is **not** in that repo — it isn't tracked anywhere
+public as of this writing. Its behavior (per this box's own cron job
+definition) is simple enough to recreate by hand: curl
+`127.0.0.1:8080/health` with a short timeout, and append `"local llama ok"`
+or `"local llama DOWN at <timestamp>"` to
+`~/.hermes/logs/local_llama_ping.log` depending on the result. Treat this as
+a real gap in this guide's reproducibility, not an oversight to skip past.
 
 ## 8. Integrations
 
@@ -322,11 +409,19 @@ operations.
    back to upstream and reintroduce the bug.
 
 ### Telegram
-Register a bot with @BotFather, get a bot token, configure it in Hermes
-(stored in `.env`, not documented further here since it's a secret). This
-box uses a single "home channel" (chat ID) as the default delivery target for
-cron job notifications and alerts (e.g. the local-llama-ping health check
-posts failures here).
+1. In Telegram, message **@BotFather**, send `/newbot`, and follow the
+   prompts (choose a display name and a unique `_bot`-suffixed username).
+   BotFather replies with a bot token — put it in `~/.hermes/.env` as
+   `TELEGRAM_BOT_TOKEN` (env var name per this box's own backup docs,
+   `jibjabjog/hermes-config`, see §12).
+2. You also need a **chat ID** to act as the delivery target — message your
+   new bot once, then message **@userinfobot** (or hit
+   `https://api.telegram.org/bot<token>/getUpdates` and read the `chat.id`
+   field back) to find your numeric ID. Set it as `TELEGRAM_HOME_CHANNEL` in
+   `.env`.
+3. This box uses that single "home channel" as the default delivery target
+   for cron job notifications and alerts (e.g. the local-llama-ping health
+   check posts failures here).
 
 ## 9. Freerouter / failover scripting
 
@@ -335,7 +430,11 @@ OpenRouter → local-model failover: check OpenRouter reachability/quota,
 and if it's degraded, flip Hermes's active model to the local llama-server
 instance from §6 instead. `set_fallback_model.py` and `model_manager.py`
 support this by reading/writing Hermes's model-selection state files
-(`~/.hermes/.model_fallback.json`, `.model_selection.json`).
+(`~/.hermes/.model_fallback.json`, `.model_selection.json`). `
+freerouter_failover.sh`'s source is in `jibjabjog/hermes-config` (§7); the
+two Python helpers, like `local_llama_ping.sh`, aren't tracked in any repo
+found on this box as of this writing — treat them the same way, as a
+reproducibility gap rather than something to search for.
 
 ## 10. Skills and plugins
 
@@ -380,14 +479,19 @@ failure class here, not a sign of a bad install.
 
 ## 12. Backups
 
-`backup_hermes.sh` (run by Hermes's own scheduler, §7) syncs
-`~/.hermes/` config, scripts, and presets to a dedicated GitHub backup repo
-(`jibjabjog/hermes-backup` on this box) daily. Set up a similar private repo
-and point the script at it. Before your first backup push, sanity-check that
-secrets are actually excluded — `redact_config_secrets.py` in
-`~/.hermes/scripts/` exists specifically to strip secrets from `config.yaml`
-before it's backed up; make sure it's actually wired into the backup path
-rather than assumed.
+`backup_hermes.sh` (source in `jibjabjog/hermes-config`, §7; run daily by
+Hermes's own scheduler, §7) syncs `~/.hermes/` config, scripts, and presets
+to a dedicated GitHub backup repo — `jibjabjog/hermes-config` itself on this
+box, not a separate `hermes-backup` repo despite that name appearing in
+older internal notes. Set up a similar repo and point the script at it.
+Before your first backup push, sanity-check that secrets are actually
+excluded — `redact_config_secrets.py` in `~/.hermes/scripts/` exists
+specifically to strip secrets from `config.yaml` before it's backed up; make
+sure it's actually wired into the backup path rather than assumed. Also
+double check the repo's actual GitHub visibility before relying on it as a
+secrets boundary — `jibjabjog/hermes-config`'s own README describes itself
+as "private," but it's visible as a **public** repo on this box; redaction
+is the thing actually protecting you here, not repo visibility.
 
 ## 13. Verifying the rebuild
 
@@ -397,7 +501,19 @@ curl -s localhost:8080/health                    # primary llama-server, if runn
 curl -s localhost:45072/health                    # failover llama-server
 gh auth status                                    # bot account logged in
 tailscale status                                  # this box + Supabase reachable
+hermes cron list                                  # all 3 jobs present, "enabled"
+hermes cron run <job-id>                          # force one job now, then check its log
 ```
+
+Beyond process/service checks, confirm the integrations actually work end to
+end, not just that credentials are present:
+- **Google Workspace:** trigger any `google-workspace` skill action (e.g.
+  list recent Calendar events) and confirm it succeeds rather than failing
+  with an import error — that specific failure mode means the venv-python
+  patch from §8 didn't take.
+- **Telegram:** force-run `local-llama-ping` (`hermes cron run <job-id>`) and
+  confirm a message actually arrives in the chat you set as
+  `TELEGRAM_HOME_CHANNEL`.
 
 ---
 
