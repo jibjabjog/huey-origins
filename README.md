@@ -6,7 +6,17 @@ with a local CPU LLM failover, GitHub/Google/Telegram integrations, and a
 self-hosted Supabase over Tailscale.
 
 **Audience:** someone who has never touched this box before. Every step
-assumes a fresh `huey` user account and an empty home directory.
+assumes a fresh, empty home directory for whatever user account runs Hermes.
+
+> **A note on the username.** This guide uses `huey` throughout — that's
+> just what this particular deployment happens to be called, not a
+> requirement. Pick any username you like; the only thing that matters is
+> using it *consistently* everywhere `huey` appears below (the `adduser`
+> command in §1, every `/home/huey/...` path, `huey@<instance-ip>` when you
+> SSH in, the `huey:huey` ownership in `chown` commands, etc.). If you're
+> not doing a find-and-replace as you go, the easiest path is to actually
+> name the account `huey` and skip the substitution entirely — there's
+> nothing special about the name beyond that.
 
 **Sources:** this guide was compiled by reading the actual running system
 (systemd units, installed packages, git remotes, config files) on 2026-09-14,
@@ -76,7 +86,9 @@ to paste into OCI.
    (Hermes's gateway, Supabase, llama-server) will be bound to `127.0.0.1` or
    reached over Tailscale, not exposed publicly — don't open extra ports.
 4. SSH in as `ubuntu` (or your chosen default user), and create the `huey`
-   user if it isn't the default:
+   user if it isn't the default — swap `huey` for whatever username you
+   want here (see the note above); just use that same name in every command
+   from here on instead of `huey`:
    ```bash
    sudo adduser huey
    sudo usermod -aG sudo huey
