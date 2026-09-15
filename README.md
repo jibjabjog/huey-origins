@@ -797,3 +797,30 @@ SQLite memory is used), Checkpoints v2/rollback, image generation input, and
 multi-agent Kanban orchestration (the DB table exists but nothing populates
 it). None of these are bugs in the rebuild above — they're just not part of
 what this deployment currently uses.
+
+---
+
+## Why "Huey"?
+
+![Huey, a three-legged maintenance drone, walking through the cargo hold of the Valley Forge](huey2.webp)
+
+Not a Hermes feature — just the naming. The bot account, the user account,
+this whole box, all take their name from one of the drone robots in
+*Silent Running*.
+
+**Silent Running (1972)**, directed by Douglas Trumbull: in a future where
+Earth's forests have died out, botanist Freeman Lowell tends the last
+surviving forest ecosystems, preserved inside geodesic domes aboard the
+space freighter *Valley Forge*. When orders arrive to jettison and destroy
+the domes so the fleet can return to commercial service, Lowell rebels —
+he kills his crewmates to save the forest and flees into the rings of
+Saturn, with only three drone robots for company.
+
+> Huey is one of those three drones aboard the *Valley Forge* — alongside
+> Dewey and Louie — originally built for simple maintenance and surgical
+> work. An accident costs him a leg partway through, and he's left walking
+> on two rather than three or four, giving him a distinct, slightly
+> lopsided gait (the pose in the still above). Reprogrammed by Lowell to
+> tend the forest and even play poker, Huey becomes his only real
+> companion in total isolation — a mute, faceless machine that somehow
+> reads as more alive than anyone else left in the story.
