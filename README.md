@@ -2,7 +2,7 @@
 
 **Purpose:** a from-nothing-to-here walkthrough for rebuilding this exact
 environment: a headless Hermes Agent deployment on an Oracle Cloud ARM64 VM,
-with a two-tier local CPU LLM failover, GitHub/Google/Telegram integrations, and a
+with a local CPU LLM failover, GitHub/Google/Telegram integrations, and a
 self-hosted Supabase over Tailscale.
 
 **Audience:** someone who has never touched this box before. Every step
@@ -313,20 +313,30 @@ from §1 is what makes this survive logout/reboot; no need to repeat it here.
 ## 6. Local LLM failover (llama.cpp)
 
 The whole point: if OpenRouter's free tier is unreachable/rate-limited,
-Hermes falls back to a model running locally on CPU. This box actually runs
-a **two-tier** local fallback, not one model — worth understanding before
-you decide what to download:
+Hermes falls back to a model running locally on CPU. This box runs exactly
+**one** local model for this — `qwen35-tiny` ("Inky", `Qwen3.5-0.8B-Q4_K_M.gguf`)
+— and it's the target for `fallback_model` *and* every `auxiliary.*`
+sub-config in `~/.hermes/config.yaml` that needs a cheap local model
+(compression, skills_hub, approval, mcp, title_generation, triage_specifier,
+kanban_decomposer, profile_describer, curator, web_extract, session_search).
 
-1. **`qwen35-fast`** (backed by `Qwen3.5-4B-Q4_K_M.gguf`) — Hermes's normal,
-   everyday fallback. It's wired directly into `~/.hermes/config.yaml`'s
-   `fallback_model` (used whenever the primary OpenRouter model errors) and
-   into `auxiliary.compression.model` (used for context compression). This
-   is a live, load-bearing model on this box, not a spare — don't skip
-   downloading it.
-2. **`qwen35-tiny`** ("Inky", backed by `Qwen3.5-0.8B-Q4_K_M.gguf`) — a
-   deeper, emergency-only tier. `freerouter_failover.sh` (§7) swaps
-   `fallback_model` to point at this instead, only during an extended
-   OpenRouter/Freerouter outage, and swaps it back on recovery.
+**This box used to run a second, larger local tier** (a 4B model,
+`qwen35-fast`, behind a multi-model router on port 8080) as the "everyday"
+fallback, with Inky reserved as a deeper emergency-only backup. Don't
+reproduce that design — it's why this section only describes one model now:
+- The router setup drifted out of sync with `config.yaml` over time:
+  `fallback_model` ended up pointing at a port nothing listened on anymore,
+  and 10 of 11 `auxiliary.*` sub-configs had a placeholder API key pointed
+  at the *real* OpenRouter cloud instead of the local router — silently
+  broken for weeks before anyone noticed, confirmed via daily config
+  backups in `jibjabjog/hermes-config`.
+- Running a 4B model with any real intent is also a bad fit for a CPU-only
+  box like this one — it sat there costing ~5.7GB RSS while mostly not even
+  being reachable correctly.
+- The fix (2026-09-15): retire the second tier entirely, repoint everything
+  at Inky, delete the 4B model file. One model, one config value
+  (`http://127.0.0.1:45072/v1`) referenced everywhere it's needed — much
+  harder for this kind of drift to happen unnoticed again.
 
 ```bash
 git clone https://github.com/ggerganov/llama.cpp ~/llama.cpp
@@ -345,63 +355,53 @@ hanging.
 
 This produces `~/llama.cpp/build/bin/llama-server`.
 
-Download GGUF-quantized models into `~/models/` (sizes chosen for a CPU-only
-24GB-RAM box — quantized, not full precision). Ubuntu 24.04's system Python
-blocks unmanaged `pip install`s (PEP 668), so install the Hugging Face CLI
-with the escape hatch this box actually used:
+Download the one GGUF-quantized model you need into `~/models/`. Ubuntu
+24.04's system Python blocks unmanaged `pip install`s (PEP 668), so install
+the Hugging Face CLI with the escape hatch this box actually used:
 
 ```bash
 pip install -U huggingface_hub --break-system-packages
 ```
 
-Then pull both models this box's own shell history confirms came from
+Then pull it — this box's own shell history confirms it came from
 `unsloth`'s GGUF releases:
 
 ```bash
 hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf --local-dir ~/models
-hf download unsloth/Qwen3.5-4B-GGUF   Qwen3.5-4B-Q4_K_M.gguf   --local-dir ~/models
 ```
 
-- This box also has a `Qwen_Qwen3.5-9B-Q6_K_L.gguf` (9B, Q6_K_L) that isn't
-  required for either fallback tier and whose exact source repo wasn't
-  confirmed in this box's history — if you want it, search Hugging Face for
-  a `Qwen3.5-9B` GGUF release using the same naming convention rather than
-  assuming the URLs above generalize.
-- (this box also has some unrelated larger Gemma/Qwen2.5 GGUFs and
-  llama.cpp's own vocab test fixtures under `~/models/` — not required for
-  either fallback tier)
+(This box also has a few unrelated larger GGUFs — a `Qwen_Qwen3.5-9B`, some
+Gemma/Qwen2.5 files, llama.cpp's own vocab test fixtures — sitting in
+`~/models/` from earlier experiments. None of them are required for
+anything this guide sets up; don't download them unless you have your own
+reason to.)
 
 ✅ **Test it:**
 ```bash
-ls -lh ~/models/*.gguf   # both files present, hundreds of MB / low GB, not 0 bytes
+ls -lh ~/models/Qwen3.5-0.8B-Q4_K_M.gguf   # a few hundred MB, not 0 bytes
 ```
 
-Run the tiny/"Inky" tier bound to localhost only (never expose this port
-publicly):
+Run it bound to localhost only (never expose this port publicly):
 
 ```bash
 ~/llama.cpp/build/bin/llama-server \
   -m ~/models/Qwen3.5-0.8B-Q4_K_M.gguf \
-  --host 127.0.0.1 --port 45072 \
-  --threads 4 --ctx-size 10240
+  --host 127.0.0.1 --port 45072 --alias Inky \
+  --threads 4 --ctx-size 10240 --n-gpu-layers 0 \
+  --cache-type-k q4_0 --cache-type-v q4_0
 ```
-
-Run `qwen35-fast` the same way on a different port (e.g. `45071`) with the
-4B model, so `fallback_model`'s `base_url` in config.yaml has something to
-point at.
 
 ✅ **Test it:**
 ```bash
 curl -s http://127.0.0.1:45072/health   # {"status":"ok"}
-curl -s http://127.0.0.1:45071/health   # {"status":"ok"}
 ```
 
-In practice this box runs both as persistent background processes rather
-than inline in a terminal — wrap each in its own systemd user unit (same
-pattern as §5) if you want them to survive reboots. The primary path,
-`llama-server` on `127.0.0.1:8080`, is the main local model server that
-Hermes talks to day-to-day; `45071`/`45072` are the two dedicated fallback
-instances behind it.
+In practice this box runs it as a persistent background process rather than
+inline in a terminal — wrap it in its own systemd user unit (same pattern
+as §5, and this box's actual unit is named `llama-qwen35-tiny.service`) if
+you want it to survive reboots. This is the *only* local `llama-server`
+process this box runs — there's no separate router or second model to
+stand up.
 
 ## 7. Hermes's internal scheduler — don't confuse it with `crontab`
 
@@ -473,12 +473,24 @@ chmod +x ~/.hermes/scripts/freerouter_failover.sh ~/.hermes/scripts/backup_herme
 ```
 
 `local_llama_ping.sh` is **not** in that repo — it isn't tracked anywhere
-public as of this writing. Its behavior (per this box's own cron job
-definition) is simple enough to recreate by hand: curl
-`127.0.0.1:8080/health` with a short timeout, and append `"local llama ok"`
-or `"local llama DOWN at <timestamp>"` to
-`~/.hermes/logs/local_llama_ping.log` depending on the result. Treat this as
-a real gap in this guide's reproducibility, not an oversight to skip past.
+public as of this writing. Its actual behavior (read directly off this box):
+a real `POST` to `127.0.0.1:45072/v1/chat/completions` (a live completion
+request, not just a `/health` check — a stronger signal that inference
+itself works, not just that the process is up), appending `"local llama
+ok"` or `"local llama DOWN"` with a timestamp to
+`~/.hermes/logs/local_llama_ping.log` depending on the result.
+
+**This script was actually broken by the 2026-09-15 router retirement (§6)
+until caught and fixed the same day** — it originally pointed at
+`127.0.0.1:8080` with `"model":"qwen35-fast"` (the retired router/4B tier),
+so the moment that router was stopped, every run started logging `DOWN`
+even though Inky itself was perfectly healthy on `45072`. A monitoring
+script that still checks a deliberately-retired endpoint will confidently
+report the wrong thing forever — worth remembering any time you retire a
+component that something else might be quietly depending on. Treat this
+script as a real gap in this guide's reproducibility (recreate it by hand,
+pointed at `45072`/`qwen35-tiny` as shown above), not an oversight to skip
+past.
 
 ## 8. Integrations
 
@@ -538,17 +550,21 @@ delivery test for §13, once a real cron job can trigger it.
 
 ## 9. Freerouter / failover scripting
 
-`~/.hermes/scripts/freerouter.py` + `freerouter_failover.sh` implement the
-deeper half of §6's two-tier failover: check OpenRouter reachability/quota,
-and if it's degraded for an extended period, swap `fallback_model` from its
-normal `qwen35-fast` (4B) target down to `qwen35-tiny` (0.8B, "Inky") —
-then swap it back once OpenRouter recovers. `set_fallback_model.py` and
-`model_manager.py` support this by reading/writing Hermes's model-selection
-state files (`~/.hermes/.model_fallback.json`, `.model_selection.json`). `
-freerouter_failover.sh`'s source is in `jibjabjog/hermes-config` (§7); the
-two Python helpers, like `local_llama_ping.sh`, aren't tracked in any repo
-found on this box as of this writing — treat them the same way, as a
-reproducibility gap rather than something to search for.
+`~/.hermes/scripts/freerouter.py` checks OpenRouter reachability/quota daily
+and rotates `model.default`/vision/etc among available free models.
+`freerouter_failover.sh` wraps that with a health check on `qwen35-tiny`
+and a Telegram notification either way. As of the 2026-09-15 fix (§6),
+**it no longer touches `fallback_model`** — that's now permanently pinned
+to `qwen35-tiny`/Inky regardless of Freerouter's daily result, so there's
+nothing left to swap. Earlier versions of this script (and this guide) used
+`set_fallback_model.py` to flip `fallback_model` between a `qwen35-fast`
+tier and `qwen35-tiny` on every run; that machinery is gone along with the
+second tier. `model_manager.py` still reads/writes Hermes's model-selection
+state files (`~/.hermes/.model_fallback.json`, `.model_selection.json`) for
+Freerouter's own `model.default` rotation, unrelated to the fallback fix.
+`freerouter_failover.sh`'s source is in `jibjabjog/hermes-config` (§7);
+`local_llama_ping.sh` isn't tracked in any repo found on this box as of this
+writing — treat that one as a reproducibility gap.
 
 ✅ **Test it:**
 ```bash
@@ -656,8 +672,8 @@ values — don't just trust that the script ran without error.
 
 ```bash
 systemctl --user status hermes-gateway.service   # active (running)
-curl -s localhost:8080/health                    # primary llama-server, if running
-curl -s localhost:45072/health                    # failover llama-server
+curl -s localhost:45072/health                   # the local fallback model (Inky)
+hermes fallback list                             # confirms qwen35-tiny is the live fallback target
 gh auth status                                    # bot account logged in
 tailscale status                                  # this box + Supabase reachable
 hermes cron list                                  # all 3 jobs present, "enabled"
