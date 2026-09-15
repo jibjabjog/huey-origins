@@ -85,13 +85,24 @@ Install the toolchain Hermes and llama.cpp both need:
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake git curl \
-  libopenblas-dev python3.11 python3.11-venv python3-pip
+  libopenblas-dev python3-pip
 ```
 
 - `build-essential` + `cmake` + `libopenblas-dev` — compiling llama.cpp with
   OpenBLAS acceleration (no GPU on this box, so BLAS matters for CPU
   throughput).
-- `python3.11` — Hermes pins to Python 3.11 (`.python-version` in the repo).
+- `python3-pip` — needed later, for downloading models in §6.
+
+**Don't `apt install python3.11` — it's not there.** Hermes pins to Python
+3.11 (`.python-version` in the repo), but Ubuntu 24.04's default repos only
+ship Python 3.12 as `python3`, and there's no `python3.11`/`python3.11-venv`
+package or deadsnakes PPA on a stock install. `apt install` aborts the
+*entire* command on any one unknown package name, so including them here
+would fail the whole line, not just those two packages. You don't need
+them anyway: `setup-hermes.sh` (§4) provisions its own isolated Python 3.11
+via `uv python install 3.11` — a standalone build under
+`~/.local/share/uv/python/`, nothing to do with the system package manager.
+That's also why `uv` gets installed next, before Python 3.11 itself.
 
 Install Node.js 22 (Hermes's `.nvmrc` pins major version 22; the web UI and
 some tooling are Node-based):
