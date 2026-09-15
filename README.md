@@ -25,6 +25,28 @@ own write-up described its cron jobs in a way that read like standard OS
 
 ---
 
+## Accounts you'll need before you start
+
+Create these up front — nothing below assumes you already have them, but
+having them ready saves backtracking mid-setup.
+
+| Account | Cost | Used for | Covered in |
+|---|---|---|---|
+| Oracle Cloud Infrastructure | Free (Always Free tier) | The VM itself | §1 |
+| GitHub — a **second** account for the bot, separate from your personal one | Free | `gh` CLI, backups, this guide's own repo | §3 |
+| OpenRouter | Free (no card needed for `openrouter/free` models) | Primary + fallback LLM access | §4 |
+| Google (with Cloud Console access) | Free | Gmail/Calendar/Drive integration | §8 |
+| Telegram | Free | Bot notifications/alerts | §8 |
+| Tailscale | Free (Personal plan, up to 100 devices) | Reaching Supabase and this box privately | §11 |
+
+You'll also want an **SSH keypair** — if you don't already have one:
+```bash
+ssh-keygen -t ed25519 -C "your-email@example.com"
+```
+Accept the default file location; a passphrase is optional but recommended.
+This gives you `~/.ssh/id_ed25519.pub` — that's the public key §1 asks you
+to paste into OCI.
+
 ## 0. What you end up with
 
 - Oracle Cloud "Always Free" ARM64 VM, Ubuntu 24.04, 4 OCPU / 24 GB RAM, no GPU
@@ -47,7 +69,9 @@ own write-up described its cron jobs in a way that read like standard OS
    - Shape: **Ampere A1** (ARM64/aarch64), 4 OCPU, 24 GB RAM — this is the
      free-tier ARM allocation.
    - Image: **Ubuntu 24.04 LTS (Noble Numbat)**.
-   - Add your SSH public key at creation time.
+   - Add your SSH public key at creation time — paste the contents of
+     `~/.ssh/id_ed25519.pub` (or whichever keypair you generated above)
+     into the "SSH keys" field.
 3. Open the security list / NSG for at least SSH (22). Everything else
    (Hermes's gateway, Supabase, llama-server) will be bound to `127.0.0.1` or
    reached over Tailscale, not exposed publicly — don't open extra ports.
@@ -152,7 +176,11 @@ uv --version   # confirms both the install AND that PATH picked it up
 ## 3. GitHub CLI + bot account
 
 Hermes uses `gh` to act on GitHub as a dedicated bot account rather than your
-personal one — keeps its commits/PRs attributable and scoped.
+personal one — keeps its commits/PRs attributable and scoped. If you don't
+already have a separate account for this, create one now at
+[github.com/signup](https://github.com/signup) with its own email address —
+using your personal account works too, but you lose the attribution/scoping
+benefit.
 
 ```bash
 sudo apt install -y gh
@@ -500,14 +528,25 @@ skill/plugin (`evey-github`) then shells out to `gh` for repo/PR/issue
 operations.
 
 ### Google Workspace
-1. Create a Google Cloud project, enable the Workspace APIs you need (Gmail,
-   Calendar, Drive, etc.).
-2. Create OAuth 2.0 credentials, download as `google_client_secret.json` into
-   `~/.hermes/`.
-3. Run through Hermes's `google-workspace` skill's OAuth flow; on success it
+1. Create a project at [console.cloud.google.com](https://console.cloud.google.com)
+   (top bar → project dropdown → "New Project"), then enable the Workspace
+   APIs you need (**APIs & Services → Library** — search for Gmail API,
+   Calendar API, Drive API, etc., enable each one individually).
+2. **APIs & Services → OAuth consent screen** — set it up before creating
+   credentials, or credential creation will nag you to. Choose **External**
+   user type unless you have a Google Workspace organization. **The common
+   gotcha:** a freshly-created consent screen defaults to "Testing" mode,
+   which only allows sign-ins from email addresses you've explicitly added
+   as test users — add your own Google account under **Audience → Test
+   users**, or OAuth will fail with an "access blocked" error even though
+   everything else is configured correctly.
+3. **APIs & Services → Credentials → Create Credentials → OAuth client ID**
+   — type **Desktop app**. Download the resulting JSON and save it as
+   `~/.hermes/google_client_secret.json`.
+4. Run through Hermes's `google-workspace` skill's OAuth flow; on success it
    writes `google_token.json` alongside it. Both files are secrets — never
    commit or copy them.
-4. **Known local patch, worth doing proactively:** the stock
+5. **Known local patch, worth doing proactively:** the stock
    `google-workspace` `SKILL.md` invokes a bare `python` to run its scripts.
    On this box bare `python` resolves to the *system* interpreter, which
    doesn't have the Google client libraries installed (only Hermes's venv
@@ -608,36 +647,77 @@ a plugin didn't silently get disabled.
 
 ## 11. Self-hosted Supabase over Tailscale
 
-A separate concern from Hermes itself, but integrated with it. Broad shape:
+A separate concern from Hermes itself, but integrated with it. The whole
+point of putting Supabase behind Tailscale is reaching it privately from
+*your other devices* — so this section covers both sides: the server, and
+getting your own laptop/phone onto the same network. Skipping the second
+half is the single most likely way to finish this section and then be
+unable to reach anything.
 
-1. Install Tailscale, join this box to your tailnet:
-   ```bash
-   curl -fsSL https://tailscale.com/install.sh | sh
-   sudo tailscale up
-   ```
-   `tailscale up` prints a login URL — open it, authenticate, and the
-   command returns once the box has joined your tailnet.
+### Create a Tailscale account
 
-   ✅ **Test it:**
-   ```bash
-   tailscale status   # this box listed, plus any other devices on your tailnet
-   tailscale ip -4    # the tailnet IP other devices will use to reach it
-   ```
-2. Set up self-hosted Supabase via Docker Compose (see
+Sign up at [tailscale.com](https://tailscale.com) (the free **Personal**
+plan covers up to 100 devices/3 users — plenty for this). You can sign in
+with an existing Google, GitHub, or Microsoft account rather than creating
+a new password. This account is what defines your **tailnet** — a private
+mesh network only your logged-in devices can join.
+
+### Connect the server
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+`tailscale up` prints a login URL — open it, sign in with the account you
+just created, and the command returns once the box has joined your tailnet.
+
+✅ **Test it:**
+```bash
+tailscale status   # this box listed as "self" (or similar)
+tailscale ip -4    # the tailnet IP other devices will use to reach it
+```
+
+### Connect your own devices
+
+This is the part that's easy to skip and then wonder why nothing is
+reachable. Install Tailscale and log into the **same account** on whatever
+you want to reach this box from:
+
+- **macOS / Windows:** download the app from
+  [tailscale.com/download](https://tailscale.com/download), install it,
+  sign in. It runs as a menu bar / system tray app — no command line
+  needed.
+- **iOS / Android:** install "Tailscale" from the App Store / Play Store,
+  sign in.
+- **Another Linux machine:** same one-liner as the server —
+  `curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up`.
+
+✅ **Test it (from the device you just connected, not from this box):**
+```bash
+tailscale status   # should now list BOTH this box and the device you're on
+ping <this-box's-tailscale-ip>   # from tailscale ip -4 above, e.g. 100.x.x.x
+```
+If `tailscale status` on your laptop/phone doesn't show this box, double
+check both are signed into the same Tailscale account — a common mistake is
+accidentally creating a second account rather than signing into the first.
+
+### Set up Supabase
+
+1. Set up self-hosted Supabase via Docker Compose (see
    `jibjabjog/self-hosted-supabase-tailscale` for the detailed guide this box
    itself produced, including first-setup failure modes).
-3. Bind Supabase's exposed ports to the Tailscale interface / rely on
+2. Bind Supabase's exposed ports to the Tailscale interface / rely on
    Tailscale ACLs so it's reachable only at its tailnet IP
    (`100.124.0.62` on this box), never on the public internet.
 
-   ✅ **Test it (from another device on the same tailnet, not from this
-   box):**
+   ✅ **Test it (from the device you connected above, not from this box):**
    ```bash
    curl -s http://<this-box's-tailscale-ip>:<supabase-port>/rest/v1/
    ```
    Should get a response from Supabase's REST endpoint. Also worth
-   confirming it *fails* from a device **not** on the tailnet — that's the
-   actual security property you're relying on.
+   confirming it *fails* from a device **not** on the tailnet (e.g. your
+   phone with WiFi/mobile data but Tailscale turned off) — that's the actual
+   security property you're relying on.
 
 This stack broke once during a Hermes update and was repaired — if you hit
 phantom-directory or demo-JWT issues on first bring-up, that's a known
