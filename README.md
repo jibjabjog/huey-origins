@@ -2,7 +2,7 @@
 
 **Purpose:** a from-nothing-to-here walkthrough for rebuilding this exact
 environment: a headless Hermes Agent deployment on an Oracle Cloud ARM64 VM,
-with a local CPU LLM failover, GitHub/Google/Telegram integrations, and a
+with a two-tier local CPU LLM failover, GitHub/Google/Telegram integrations, and a
 self-hosted Supabase over Tailscale.
 
 **Audience:** someone who has never touched this box before. Every step
@@ -71,11 +71,19 @@ own write-up described its cron jobs in a way that read like standard OS
    **Every command in the rest of this guide assumes you're logged in as
    `huey`, not `ubuntu`** — all the paths (`~/.hermes`, `~/llama.cpp`,
    `~/models`, the `systemd --user` service) are `huey`'s.
+
+   ✅ **Test it:** `whoami` should print `huey`; `groups` should list `sudo`.
+   If either doesn't match, you're still on `ubuntu` or the key copy didn't
+   take — fix that before going any further.
 6. **Enable linger** for `huey` so user-level systemd services keep running
    after you log out and across reboots — this is what lets
    `hermes-gateway.service` run as a headless background service:
    ```bash
    sudo loginctl enable-linger huey
+   ```
+   ✅ **Test it:**
+   ```bash
+   loginctl show-user huey -p Linger   # should print Linger=yes
    ```
 
 ## 2. Base OS packages
@@ -104,12 +112,23 @@ via `uv python install 3.11` — a standalone build under
 `~/.local/share/uv/python/`, nothing to do with the system package manager.
 That's also why `uv` gets installed next, before Python 3.11 itself.
 
+✅ **Test it:**
+```bash
+gcc --version && cmake --version
+```
+Both should print a version, not `command not found`.
+
 Install Node.js 22 (Hermes's `.nvmrc` pins major version 22; the web UI and
 some tooling are Node-based):
 
 ```bash
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt install -y nodejs
+```
+
+✅ **Test it:**
+```bash
+node --version   # should print v22.x.x
 ```
 
 Install `uv` (fast Python package manager Hermes's setup script prefers over
@@ -124,6 +143,11 @@ shells. Either start a fresh SSH session, or run `source ~/.bashrc` (or
 `source ~/.local/bin/env`, which the installer also writes) before
 continuing — otherwise `uv --version` in the next step just says
 `command not found`.
+
+✅ **Test it:**
+```bash
+uv --version   # confirms both the install AND that PATH picked it up
+```
 
 ## 3. GitHub CLI + bot account
 
@@ -142,6 +166,12 @@ gh auth login
   gists, workflow dispatch, and read-only org visibility.
 - This writes credentials to `~/.config/gh/` — treat that directory as
   sensitive; don't commit or copy it anywhere.
+
+✅ **Test it:**
+```bash
+gh auth status   # confirms account, scopes, and that the token is live
+gh repo list     # confirms it can actually talk to the API, not just that a token is stored
+```
 
 ## 4. Clone and install Hermes Agent
 
@@ -177,6 +207,15 @@ What `setup-hermes.sh` does (worth knowing rather than just trusting):
 At the end of this step you should have `~/.hermes/config.yaml` and
 `~/.hermes/.env` (the latter with your real API keys filled in — this file
 is off-limits to read/copy from here on).
+
+✅ **Test it:**
+```bash
+~/.hermes/hermes-agent/venv/bin/python --version   # should print Python 3.11.x
+hermes doctor                                       # full self-check: config,
+                                                      # venv, keys, tool backends
+```
+`hermes doctor` is the single most useful command in this guide — run it
+again any time something feels off later on, not just here.
 
 ### Key config.yaml choices made on this box
 
@@ -260,21 +299,48 @@ systemctl --user enable --now hermes-gateway.service
 systemctl --user status hermes-gateway.service
 ```
 
-Check it survives logout (this is what linger from §1 buys you):
+✅ **Test it:**
 ```bash
-loginctl show-user huey -p Linger   # should print Linger=yes
+hermes status                               # gateway, config, integrations at a glance
+journalctl --user -u hermes-gateway -n 20   # tail the actual startup log
 ```
+`systemctl ... status` only tells you the *process* is running; `hermes
+status` tells you whether the *agent* is actually healthy (right model
+configured, gateway reachable). Worth checking both — a process can be
+"active (running)" and still be misconfigured underneath. The linger check
+from §1 is what makes this survive logout/reboot; no need to repeat it here.
 
 ## 6. Local LLM failover (llama.cpp)
 
 The whole point: if OpenRouter's free tier is unreachable/rate-limited,
-Hermes falls back to a small model running locally on CPU.
+Hermes falls back to a model running locally on CPU. This box actually runs
+a **two-tier** local fallback, not one model — worth understanding before
+you decide what to download:
+
+1. **`qwen35-fast`** (backed by `Qwen3.5-4B-Q4_K_M.gguf`) — Hermes's normal,
+   everyday fallback. It's wired directly into `~/.hermes/config.yaml`'s
+   `fallback_model` (used whenever the primary OpenRouter model errors) and
+   into `auxiliary.compression.model` (used for context compression). This
+   is a live, load-bearing model on this box, not a spare — don't skip
+   downloading it.
+2. **`qwen35-tiny`** ("Inky", backed by `Qwen3.5-0.8B-Q4_K_M.gguf`) — a
+   deeper, emergency-only tier. `freerouter_failover.sh` (§7) swaps
+   `fallback_model` to point at this instead, only during an extended
+   OpenRouter/Freerouter outage, and swaps it back on recovery.
 
 ```bash
 git clone https://github.com/ggerganov/llama.cpp ~/llama.cpp
 cd ~/llama.cpp
 cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS
 cmake --build build --config Release -j$(nproc)
+```
+
+This will take several minutes on a 4-core ARM box — it's compiling, not
+hanging.
+
+✅ **Test it:**
+```bash
+~/llama.cpp/build/bin/llama-server --version
 ```
 
 This produces `~/llama.cpp/build/bin/llama-server`.
@@ -288,7 +354,7 @@ with the escape hatch this box actually used:
 pip install -U huggingface_hub --break-system-packages
 ```
 
-Then pull the two models this box's own shell history confirms came from
+Then pull both models this box's own shell history confirms came from
 `unsloth`'s GGUF releases:
 
 ```bash
@@ -296,20 +362,21 @@ hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf --local-dir ~/mod
 hf download unsloth/Qwen3.5-4B-GGUF   Qwen3.5-4B-Q4_K_M.gguf   --local-dir ~/models
 ```
 
-- `Qwen3.5-0.8B-Q4_K_M.gguf` — tiny, used as the actual failover model
-  ("Inky")
-- `Qwen3.5-4B-Q4_K_M.gguf` — a larger local option, available but not the
-  default failover
 - This box also has a `Qwen_Qwen3.5-9B-Q6_K_L.gguf` (9B, Q6_K_L) that isn't
-  required for the failover setup and whose exact source repo wasn't
+  required for either fallback tier and whose exact source repo wasn't
   confirmed in this box's history — if you want it, search Hugging Face for
   a `Qwen3.5-9B` GGUF release using the same naming convention rather than
-  assuming the URL above generalizes.
+  assuming the URLs above generalize.
 - (this box also has some unrelated larger Gemma/Qwen2.5 GGUFs and
   llama.cpp's own vocab test fixtures under `~/models/` — not required for
-  the failover setup itself)
+  either fallback tier)
 
-Run the failover server bound to localhost only (never expose this port
+✅ **Test it:**
+```bash
+ls -lh ~/models/*.gguf   # both files present, hundreds of MB / low GB, not 0 bytes
+```
+
+Run the tiny/"Inky" tier bound to localhost only (never expose this port
 publicly):
 
 ```bash
@@ -319,11 +386,22 @@ publicly):
   --threads 4 --ctx-size 10240
 ```
 
-In practice this box runs it as a persistent background process rather than
-inline in a terminal — wrap it in its own systemd user unit (same pattern as
-§5) if you want it to survive reboots. The primary path, `llama-server` on
-`127.0.0.1:8080`, is the main local model server; `45072` is the dedicated
-tiny failover instance.
+Run `qwen35-fast` the same way on a different port (e.g. `45071`) with the
+4B model, so `fallback_model`'s `base_url` in config.yaml has something to
+point at.
+
+✅ **Test it:**
+```bash
+curl -s http://127.0.0.1:45072/health   # {"status":"ok"}
+curl -s http://127.0.0.1:45071/health   # {"status":"ok"}
+```
+
+In practice this box runs both as persistent background processes rather
+than inline in a terminal — wrap each in its own systemd user unit (same
+pattern as §5) if you want them to survive reboots. The primary path,
+`llama-server` on `127.0.0.1:8080`, is the main local model server that
+Hermes talks to day-to-day; `45071`/`45072` are the two dedicated fallback
+instances behind it.
 
 ## 7. Hermes's internal scheduler — don't confuse it with `crontab`
 
@@ -370,8 +448,14 @@ hermes cron create "0 3 * * *" --name "hermes-backup" \
 `--no-agent` matters here: it means the script's stdout is delivered as-is
 without ever routing through the LLM (a "classic watchdog pattern" per
 `hermes cron create --help`) — appropriate for jobs that are pure
-shell/health-check logic, not reasoning tasks. Confirm registration with
-`hermes cron list`.
+shell/health-check logic, not reasoning tasks.
+
+✅ **Test it:**
+```bash
+hermes cron list                    # all 3 present, state "scheduled"
+hermes cron run <job-id>            # force one to run now, don't wait for its schedule
+hermes cron runs <job-id>           # check the result of that forced run
+```
 
 **Script provenance — these aren't upstream Hermes files.**
 `freerouter_failover.sh` and `backup_hermes.sh` are bespoke scripts written
@@ -421,6 +505,14 @@ operations.
    since a future `hermes update` can silently revert the live skill file
    back to upstream and reintroduce the bug.
 
+✅ **Test it:**
+```bash
+~/.hermes/hermes-agent/venv/bin/python -c "import google.auth" && echo "libs present"
+```
+If this errors but the same line works when you drop `~/.hermes/hermes-agent/venv/bin/`
+(i.e. it only works with the *system* Python), that's the exact symptom of
+the patch above not being applied.
+
 ### Telegram
 1. In Telegram, message **@BotFather**, send `/newbot`, and follow the
    prompts (choose a display name and a unique `_bot`-suffixed username).
@@ -436,18 +528,36 @@ operations.
    for cron job notifications and alerts (e.g. the local-llama-ping health
    check posts failures here).
 
+✅ **Test it:**
+```bash
+curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getMe"
+```
+Returns `{"ok":true,"result":{...your bot's username...}}` if the token is
+valid — a read-only check, doesn't message anyone. Saving an actual message
+delivery test for §13, once a real cron job can trigger it.
+
 ## 9. Freerouter / failover scripting
 
 `~/.hermes/scripts/freerouter.py` + `freerouter_failover.sh` implement the
-OpenRouter → local-model failover: check OpenRouter reachability/quota,
-and if it's degraded, flip Hermes's active model to the local llama-server
-instance from §6 instead. `set_fallback_model.py` and `model_manager.py`
-support this by reading/writing Hermes's model-selection state files
-(`~/.hermes/.model_fallback.json`, `.model_selection.json`). `
+deeper half of §6's two-tier failover: check OpenRouter reachability/quota,
+and if it's degraded for an extended period, swap `fallback_model` from its
+normal `qwen35-fast` (4B) target down to `qwen35-tiny` (0.8B, "Inky") —
+then swap it back once OpenRouter recovers. `set_fallback_model.py` and
+`model_manager.py` support this by reading/writing Hermes's model-selection
+state files (`~/.hermes/.model_fallback.json`, `.model_selection.json`). `
 freerouter_failover.sh`'s source is in `jibjabjog/hermes-config` (§7); the
 two Python helpers, like `local_llama_ping.sh`, aren't tracked in any repo
 found on this box as of this writing — treat them the same way, as a
 reproducibility gap rather than something to search for.
+
+✅ **Test it:**
+```bash
+~/.hermes/scripts/freerouter_failover.sh dry   # the script's own test mode
+```
+Dry mode skips the live OpenRouter check and the gateway restart, so it's
+safe to run any time — good for confirming the script and its dependencies
+(qwen35-tiny reachable, Telegram configured) are wired up correctly before
+trusting it to run unattended at 06:00.
 
 ## 10. Skills and plugins
 
@@ -470,6 +580,16 @@ Both directories are populated by cloning/copying the relevant sources in —
 this guide doesn't enumerate each one's origin since that's Hermes-specific
 packaging, not host setup.
 
+✅ **Test it:**
+```bash
+hermes skills list
+hermes plugins list
+```
+Whatever you've installed so far should show up here — useful as a running
+checklist while you work through recreating this box's set, and as a sanity
+check after any future `hermes update` (§'s Known version drift below) that
+a plugin didn't silently get disabled.
+
 ## 11. Self-hosted Supabase over Tailscale
 
 A separate concern from Hermes itself, but integrated with it. Broad shape:
@@ -479,12 +599,29 @@ A separate concern from Hermes itself, but integrated with it. Broad shape:
    curl -fsSL https://tailscale.com/install.sh | sh
    sudo tailscale up
    ```
+   `tailscale up` prints a login URL — open it, authenticate, and the
+   command returns once the box has joined your tailnet.
+
+   ✅ **Test it:**
+   ```bash
+   tailscale status   # this box listed, plus any other devices on your tailnet
+   tailscale ip -4    # the tailnet IP other devices will use to reach it
+   ```
 2. Set up self-hosted Supabase via Docker Compose (see
    `jibjabjog/self-hosted-supabase-tailscale` for the detailed guide this box
    itself produced, including first-setup failure modes).
 3. Bind Supabase's exposed ports to the Tailscale interface / rely on
    Tailscale ACLs so it's reachable only at its tailnet IP
    (`100.124.0.62` on this box), never on the public internet.
+
+   ✅ **Test it (from another device on the same tailnet, not from this
+   box):**
+   ```bash
+   curl -s http://<this-box's-tailscale-ip>:<supabase-port>/rest/v1/
+   ```
+   Should get a response from Supabase's REST endpoint. Also worth
+   confirming it *fails* from a device **not** on the tailnet — that's the
+   actual security property you're relying on.
 
 This stack broke once during a Hermes update and was repaired — if you hit
 phantom-directory or demo-JWT issues on first bring-up, that's a known
@@ -505,6 +642,15 @@ double check the repo's actual GitHub visibility before relying on it as a
 secrets boundary — `jibjabjog/hermes-config`'s own README describes itself
 as "private," but it's visible as a **public** repo on this box; redaction
 is the thing actually protecting you here, not repo visibility.
+
+✅ **Test it:**
+```bash
+~/.hermes/scripts/backup_hermes.sh    # run it once by hand, don't wait for 03:00
+tail -20 ~/.hermes/logs/backup.log
+```
+Then actually open the pushed `config.yaml` in the backup repo on GitHub and
+confirm the secret-shaped fields read as redacted placeholders, not real
+values — don't just trust that the script ran without error.
 
 ## 13. Verifying the rebuild
 
