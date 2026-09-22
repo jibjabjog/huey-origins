@@ -2,7 +2,8 @@
 
 **Purpose:** a from-nothing-to-here walkthrough for rebuilding this exact
 environment: a headless Hermes Agent deployment on an Oracle Cloud ARM64 VM,
-with a local CPU LLM failover, GitHub/Google/Telegram integrations, and a
+with two local CPU LLMs for fallback and light auxiliary tasks,
+GitHub/Google/Telegram integrations, and a
 self-hosted Supabase over Tailscale.
 
 **Audience:** someone who has never touched this box before. Every step
@@ -61,9 +62,11 @@ to paste into OCI.
 
 - Oracle Cloud "Always Free" ARM64 VM, Ubuntu 24.04, 4 OCPU / 24 GB RAM, no GPU
 - Hermes Agent (Nous Research) running as a `systemd --user` background service
-- A local llama.cpp build providing a CPU-only fallback model when OpenRouter
-  is unreachable or rate-limited
-- GitHub, Google Workspace, and Telegram wired into Hermes
+- A local llama.cpp build running two CPU models: gemma-4-E2B as the real
+  `fallback_model` when OpenRouter errors, and a tiny Inky model for cheap
+  auxiliary tasks + a health beacon (§6)
+- GitHub, Google Workspace, and Telegram wired into Hermes, including
+  local, free voice transcription and speech replies over Telegram (§8)
 - A self-hosted Supabase stack, reachable only over Tailscale
 - Hermes's own "evey-*" plugin suite (30+ plugins) and ~25 custom skills
 - Two independent scheduling systems: the OS `crontab` (for one thing:
@@ -353,30 +356,53 @@ from §1 is what makes this survive logout/reboot; no need to repeat it here.
 ## 6. Local LLM failover (llama.cpp)
 
 The whole point: if OpenRouter's free tier is unreachable/rate-limited,
-Hermes falls back to a model running locally on CPU. This box runs exactly
-**one** local model for this — `qwen35-tiny` ("Inky", `Qwen3.5-0.8B-Q4_K_M.gguf`)
-— and it's the target for `fallback_model` *and* every `auxiliary.*`
-sub-config in `~/.hermes/config.yaml` that needs a cheap local model
-(compression, skills_hub, approval, mcp, title_generation, triage_specifier,
-kanban_decomposer, profile_describer, curator, web_extract, session_search).
+Hermes falls back to a model running locally on CPU. **As of 2026-09-18,
+this box runs two local models with two different jobs** — don't skip
+either half of this section:
 
-**This box used to run a second, larger local tier** (a 4B model,
-`qwen35-fast`, behind a multi-model router on port 8080) as the "everyday"
-fallback, with Inky reserved as a deeper emergency-only backup. Don't
-reproduce that design — it's why this section only describes one model now:
-- The router setup drifted out of sync with `config.yaml` over time:
-  `fallback_model` ended up pointing at a port nothing listened on anymore,
-  and 10 of 11 `auxiliary.*` sub-configs had a placeholder API key pointed
-  at the *real* OpenRouter cloud instead of the local router — silently
-  broken for weeks before anyone noticed, confirmed via daily config
-  backups in `jibjabjog/hermes-config`.
-- Running a 4B model with any real intent is also a bad fit for a CPU-only
-  box like this one — it sat there costing ~5.7GB RSS while mostly not even
-  being reachable correctly.
-- The fix (2026-09-15): retire the second tier entirely, repoint everything
-  at Inky, delete the 4B model file. One model, one config value
-  (`http://127.0.0.1:45072/v1`) referenced everywhere it's needed — much
-  harder for this kind of drift to happen unnoticed again.
+- **`qwen35-tiny`** ("Inky", 0.8B) — handles all 11 `auxiliary.*`
+  sub-configs in `config.yaml` (compression, skills_hub, approval, mcp,
+  title_generation, triage_specifier, kanban_decomposer, profile_describer,
+  curator, web_extract, session_search) and the `local-llama-ping` cron
+  health beacon (§7). Small, cheap, always resident — right for frequent,
+  low-stakes calls.
+- **`gemma-4-E2B`** — Hermes's actual `fallback_model`: what a real
+  conversation fails over to when the primary OpenRouter model errors.
+  Chosen after a dedicated evaluation project (**"Inky's Gym"**, private
+  repo `jibjabjog/ai-gym`) benchmarked several small local models —
+  character coherence, a simulated-incident agent loop, a job interview —
+  and found Inky capable of the auxiliary work above but not of carrying a
+  real fallback conversation or reliably finishing an agentic task; gemma
+  was the only candidate that did, reliably, at a low temperature.
+
+**History worth knowing before you copy this blindly:** this box's fallback
+setup has broken twice already, in two different ways — both are why the
+setup below looks the way it does:
+1. **2026-09-15:** an earlier two-tier design (4B "everyday" fallback + Inky
+   as emergency backup) drifted silently for weeks — `fallback_model`
+   pointed at a dead port, 10 of 11 `auxiliary.*` blocks had a placeholder
+   key pointed at the real OpenRouter cloud instead of localhost. Fixed by
+   retiring that design and pointing everything at Inky alone.
+2. **2026-09-18→22:** gemma was deployed as the new fallback (retiring the
+   09-15 simplification), but the router defaulted to **4 parallel slots**
+   with nothing pinning requests to a consistent one. A dedicated warm-up
+   script (below) that's supposed to keep gemma's ~19,000-token system
+   prompt cached — so a real failover doesn't pay a ~17-20 minute cold-start
+   penalty — kept landing on a *different* slot each cycle, so the cache
+   never persisted: it silently redid the full prefill from scratch every
+   ~20 minutes, non-stop, for days (~300% CPU sustained). Fixed 2026-09-22
+   by pinning the model to a single slot (`parallel = 1` below) — with only
+   one slot, there's no ambiguity left, and cache reuse now measurably works
+   (`19057/19058` tokens served from cache on a repeat request, confirmed
+   live).
+
+**The lesson underneath both:** this setup has enough moving parts
+(`config.yaml`, a systemd unit, a presets file, two guard scripts) that
+nothing here should be trusted just because it once worked — see §7's
+`fallback-guard` cron job below, which exists specifically to keep catching
+this class of drift automatically.
+
+### Build llama.cpp
 
 ```bash
 git clone https://github.com/ggerganov/llama.cpp ~/llama.cpp
@@ -393,11 +419,13 @@ hanging.
 ~/llama.cpp/build/bin/llama-server --version
 ```
 
-This produces `~/llama.cpp/build/bin/llama-server`.
+This produces `~/llama.cpp/build/bin/llama-server`, used by both models below.
 
-Download the one GGUF-quantized model you need into `~/models/`. Ubuntu
-24.04's system Python blocks unmanaged `pip install`s (PEP 668), so install
-the Hugging Face CLI with the escape hatch this box actually used:
+### Inky (qwen35-tiny) — auxiliary tasks + health beacon
+
+Download it into `~/models/`. Ubuntu 24.04's system Python blocks unmanaged
+`pip install`s (PEP 668), so install the Hugging Face CLI with the escape
+hatch this box actually used:
 
 ```bash
 pip install -U huggingface_hub --break-system-packages
@@ -438,19 +466,140 @@ curl -s http://127.0.0.1:45072/health   # {"status":"ok"}
 
 In practice this box runs it as a persistent background process rather than
 inline in a terminal — wrap it in its own systemd user unit (same pattern
-as §5, and this box's actual unit is named `llama-qwen35-tiny.service`) if
-you want it to survive reboots. This is the *only* local `llama-server`
-process this box runs — there's no separate router or second model to
-stand up.
+as §5; this box's actual unit is named `llama-qwen35-tiny.service`) if you
+want it to survive reboots.
+
+### gemma-4-E2B — the real fallback, behind a router
+
+Unlike Inky, gemma isn't manually downloaded into `~/models/` — it's
+fetched automatically by llama-server's own `--hf-repo` flag on first load,
+from `google/gemma-4-E2B-it-qat-q4_0-gguf` on Hugging Face (cached under
+`~/.cache/huggingface/hub/`). You don't need a separate download step for
+it, just the flag in the launch command below.
+
+It runs behind a **router** — `llama-server`'s own multi-model mode, which
+can load more than one preset on demand — rather than a single dedicated
+process like Inky's. Create `~/.config/systemd/user/llama-router.service`:
+
+```ini
+[Unit]
+Description=llama.cpp router server (multi-model)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/huey/llama.cpp/build/bin
+ExecStart=/home/huey/llama.cpp/build/bin/llama-server \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --jinja \
+  -fa on \
+  -t 4 \
+  -ngl 0 \
+  -c 65536 \
+  --cache-type-k q4_0 \
+  --cache-type-v q4_0 \
+  --models-preset /home/huey/llama-presets.ini \
+  --models-max 2 \
+  --models-autoload \
+  --timeout 3600
+
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+`--models-preset` points at `~/llama-presets.ini`, which is where each
+model's individual flags live (not the systemd unit — the router itself
+stays generic). This box's actual file:
+
+```ini
+; ~/llama-presets.ini
+; Use hyphenated keys matching CLI long names (no leading --)
+
+[qwen35-tiny]
+model    = /home/huey/models/Qwen3.5-0.8B-Q4_K_M.gguf
+ctx-size = 4096
+threads  = 4
+reasoning-budget = 0
+
+; gemma-4-E2B is discovered from the HF cache; this section only overrides
+; its defaults. Hermes sends no temperature, so the server default applies —
+; ai-gym found gemma fixes the simulated incident 3/3 at 0.3 vs 1/3 at 1.0.
+; reasoning off: Hermes sends no thinking toggle, and thinking cost ~50 s per reply.
+; load-on-startup: keep gemma resident so a failover never pays the ~16 s cold load.
+; parallel = 1: see the cache-eviction incident above — do not remove this.
+[google/gemma-4-E2B-it-qat-q4_0-gguf:IT]
+temp = 0.3
+reasoning = off
+load-on-startup = true
+parallel = 1
+```
+
+(A `[qwen35-fast]` section pointing at a deleted 4B model file is also
+still in this box's actual `llama-presets.ini` — dead weight left over from
+the 09-15 retirement, harmless, not reproduced here.)
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now llama-router.service
+```
+
+✅ **Test it:**
+```bash
+systemctl --user status llama-router.service   # active (running)
+# wait ~15-20s for load-on-startup to finish, then:
+curl -s http://127.0.0.1:8080/v1/models | python3 -m json.tool | grep '"id"'
+```
+
+### Keeping gemma healthy: `fallback_guard.sh` + `fallback_warm.sh`
+
+A plain systemd unit isn't enough — the 09-15 and 09-18 incidents above
+both happened *underneath* services that reported themselves as healthy.
+This box runs two scripts, sourced from `jibjabjog/hermes-config` and
+registered as the `fallback-guard` cron job (§7 has the clone command and
+exact `hermes cron create`), that actually verify the fallback works rather
+than just that a port is open:
+
+- **`fallback_guard.sh`** (run every 5 min via cron, §7) checks: is the
+  router running (starts it if not); does the model actually answer a real
+  completion, not just `/health` (restarts the router once if not); does
+  `config.yaml`'s `fallback_model` still point at gemma (drift check —
+  exactly what caught nothing back on 09-15, since nothing was checking at
+  all); and, only when healthy and idle, triggers the warm-up below. Silent
+  on Telegram when healthy; only speaks up on a state change.
+- **`fallback_warm.sh`** rebuilds the exact system prompt + tool schemas
+  Hermes would really send on a Telegram failover (reading the live
+  session's stored prompt, offline — nothing is sent to Telegram) and feeds
+  it to gemma as a 1-token completion, so the ~19k-token prefill is already
+  cached *before* a real failover ever needs it. Runs detached so a cold
+  prefill (~17-20 min) doesn't block the cron job.
+
+✅ **Test it:**
+```bash
+~/.hermes/scripts/fallback_guard.sh -v   # prints a status line either way
+tail -20 ~/.hermes/logs/fallback_guard.log
+```
+For genuine proof the cache is working (not just that the scripts run
+without error), send the same payload twice and check the second call's
+cache hit:
+```bash
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  --data-binary @~/.hermes/cache/warm_telegram.json \
+  | python3 -c "import json,sys; t=json.load(sys.stdin)['timings']; print('cache_n:', t['cache_n'], '/', t.get('prompt_n'))"
+```
+A near-full cache hit (most of the prompt's tokens, not 0) confirms it —
+this is the exact test that caught the 09-18→22 incident.
 
 ## 7. Hermes's internal scheduler — don't confuse it with `crontab`
 
 **Important gotcha found while writing this guide:** Hermes's own
-self-documentation (`huey-origins` README) lists three "cron jobs" —
-Freerouter (daily 06:00), local-llama-ping (every 15 min), hermes-backup
-(daily 03:00) — described in a way that reads like standard OS cron. **They
-are not in the OS crontab.** Checking `crontab -l` on this box shows only two
-unrelated jobs (`rat-backup.sh`, for a different backup system entirely).
+self-documentation (`huey-origins` README) lists these as "cron jobs" —
+described in a way that reads like standard OS cron. **They are not in the
+OS crontab.** Checking `crontab -l` on this box shows only two unrelated
+jobs (`rat-backup.sh`, for a different backup system entirely).
 
 Hermes's jobs actually live in its own internal scheduler, state at
 `~/.hermes/cron/jobs.json`, driven by a ticker process inside the gateway —
@@ -460,19 +609,24 @@ this and reach for `crontab -e` expecting to find Hermes's jobs, you won't —
 that was a documentation imprecision from Hermes's self-audit, not a real
 discrepancy in the running system once you know where to look.
 
-The three Hermes-managed jobs on this box, for reference:
+The four Hermes-managed jobs on this box, for reference:
 
 | Job | Schedule | Script | Delivery |
 |---|---|---|---|
 | Freerouter | `0 6 * * *` | `freerouter_failover.sh` | local (log file) |
 | local-llama-ping | `*/15 * * * *` | `local_llama_ping.sh` | Telegram |
 | hermes-backup | `0 3 * * *` | `backup_hermes.sh` | local |
+| fallback-guard | `*/5 * * * *` | `fallback_guard.sh` | Telegram |
+
+`fallback-guard` is the newest (added 2026-09-18 alongside the gemma
+fallback, §6) — it's what actually keeps gemma healthy and its cache warm,
+not just a health check.
 
 Scripts live in `~/.hermes/scripts/` (see the script-provenance note below —
 they're not part of the upstream `hermes-agent` clone). Register the jobs
 through Hermes's own CLI (`hermes cron create`, aliased `add`) once the
 scripts are in place — don't hand-edit `jobs.json` directly. The exact
-commands that reproduce this box's three jobs:
+commands that reproduce this box's four jobs:
 
 ```bash
 hermes cron create "0 6 * * *" --name "Freerouter" \
@@ -483,6 +637,9 @@ hermes cron create "*/15 * * * *" --name "local-llama-ping" \
 
 hermes cron create "0 3 * * *" --name "hermes-backup" \
   --script backup_hermes.sh --no-agent --deliver local
+
+hermes cron create "*/5 * * * *" --name "fallback-guard" \
+  --script fallback_guard.sh --no-agent --deliver telegram
 ```
 
 `--no-agent` matters here: it means the script's stdout is delivered as-is
@@ -492,14 +649,15 @@ shell/health-check logic, not reasoning tasks.
 
 ✅ **Test it:**
 ```bash
-hermes cron list                    # all 3 present, state "scheduled"
+hermes cron list                    # all 4 present, state "scheduled"
 hermes cron run <job-id>            # force one to run now, don't wait for its schedule
 hermes cron runs <job-id>           # check the result of that forced run
 ```
 
 **Script provenance — these aren't upstream Hermes files.**
-`freerouter_failover.sh` and `backup_hermes.sh` are bespoke scripts written
-for this deployment; their actual source is kept in the sibling repo
+`freerouter_failover.sh`, `backup_hermes.sh`, `fallback_guard.sh`, and
+`fallback_warm.sh` are all bespoke scripts written for this deployment;
+their actual source is kept in the sibling repo
 [`jibjabjog/hermes-config`](https://github.com/jibjabjog/hermes-config),
 which also documents the required env vars
 (`OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_HOME_CHANNEL`) and has
@@ -509,7 +667,10 @@ its own troubleshooting section. Clone it and copy the scripts in:
 git clone https://github.com/jibjabjog/hermes-config.git ~/.hermes-config
 cp ~/.hermes-config/freerouter_failover.sh ~/.hermes/scripts/
 cp ~/.hermes-config/backup_hermes.sh ~/.hermes/scripts/
-chmod +x ~/.hermes/scripts/freerouter_failover.sh ~/.hermes/scripts/backup_hermes.sh
+cp ~/.hermes-config/fallback_guard.sh ~/.hermes/scripts/
+cp ~/.hermes-config/fallback_warm.sh ~/.hermes/scripts/
+chmod +x ~/.hermes/scripts/freerouter_failover.sh ~/.hermes/scripts/backup_hermes.sh \
+  ~/.hermes/scripts/fallback_guard.sh ~/.hermes/scripts/fallback_warm.sh
 ```
 
 `local_llama_ping.sh` is **not** in that repo — it isn't tracked anywhere
@@ -599,20 +760,78 @@ Returns `{"ok":true,"result":{...your bot's username...}}` if the token is
 valid — a read-only check, doesn't message anyone. Saving an actual message
 delivery test for §13, once a real cron job can trigger it.
 
+### Voice messages: STT/TTS over Telegram
+
+Separate from the bot token/chat ID above, but worth setting up
+deliberately rather than leaving to defaults: this box transcribes incoming
+Telegram voice notes and can speak its replies back — both **fully local**,
+no cloud STT/TTS API key or cost involved.
+
+**Speech-to-text** (`stt:` in `config.yaml`):
+```yaml
+stt:
+  enabled: true
+  provider: local
+  local:
+    model: tiny
+    language: en
+```
+`provider: local` uses `faster-whisper` (already in Hermes's venv — see
+§4). This box uses the `tiny` Whisper model: fastest and least accurate of
+the five sizes (`tiny`/`base`/`small`/`medium`/`large-v3`), a deliberate
+trade-off for CPU-only hardware where a bigger model would mean a
+noticeably slower transcription. `language: en` skips auto-detection,
+which otherwise frequently misidentifies short or accented clips — set it
+to your own language code (or `""` for auto-detect) if you're not speaking
+English to it. Voice notes get transcribed automatically; no extra
+per-message setup needed beyond this config being present.
+
+**Text-to-speech** (`tts:` in `config.yaml`):
+```yaml
+tts:
+  provider: piper
+voice:
+  auto_tts: true
+```
+`piper` is a fully local, open-source TTS engine — again, no API key. Its
+voice models (`.onnx` files) live in `~/.hermes/cache/piper-voices/`; this
+box has `en_US-lessac` downloaded. `voice.auto_tts: true` means every text
+reply is *also* spoken back as a voice note automatically, not just
+transcribed replies to voice input — if you only want spoken replies when
+the user sent voice, that's a different (undocumented on this box) knob to
+look for, not the default here.
+
+✅ **Test it:**
+```bash
+echo "test" | ~/.hermes/hermes-agent/venv/bin/piper \
+  --model ~/.hermes/cache/piper-voices/en_US-lessac-low.onnx \
+  --output_file /tmp/piper-test.wav
+file /tmp/piper-test.wav   # should say "WAVE audio", not empty/error
+```
+That confirms Piper itself works, independent of Telegram. For the full
+loop, send your bot a voice message on Telegram and confirm two things
+come back: a text transcript, and a spoken voice-note reply.
+
 ## 9. Freerouter / failover scripting
 
 `~/.hermes/scripts/freerouter.py` checks OpenRouter reachability/quota daily
 and rotates `model.default`/vision/etc among available free models.
 `freerouter_failover.sh` wraps that with a health check on `qwen35-tiny`
-and a Telegram notification either way. As of the 2026-09-15 fix (§6),
-**it no longer touches `fallback_model`** — that's now permanently pinned
-to `qwen35-tiny`/Inky regardless of Freerouter's daily result, so there's
-nothing left to swap. Earlier versions of this script (and this guide) used
-`set_fallback_model.py` to flip `fallback_model` between a `qwen35-fast`
-tier and `qwen35-tiny` on every run; that machinery is gone along with the
-second tier. `model_manager.py` still reads/writes Hermes's model-selection
-state files (`~/.hermes/.model_fallback.json`, `.model_selection.json`) for
-Freerouter's own `model.default` rotation, unrelated to the fallback fix.
+(Inky) specifically and a Telegram notification either way — it's about
+Freerouter's own daily model rotation, not the primary `fallback_model`.
+
+**Don't confuse this with `fallback-guard` (§6/§7).** Two separate
+mechanisms, easy to conflate since both are about "the local model":
+Freerouter/`freerouter_failover.sh` runs once a day, checks Inky, and
+rotates which *OpenRouter* model is primary — it doesn't touch
+`fallback_model` at all as of the 2026-09-15 fix (earlier versions used
+`set_fallback_model.py` to flip `fallback_model` between two local tiers on
+every run; that machinery is gone). `fallback-guard`/`fallback_guard.sh`
+runs every 5 minutes, checks gemma specifically, and is what actually keeps
+the real `fallback_model` (§6) healthy and its cache warm. `model_manager.py`
+reads/writes Hermes's model-selection state files
+(`~/.hermes/.model_fallback.json`, `.model_selection.json`) for Freerouter's
+own rotation — also unrelated to `fallback_model`.
 `freerouter_failover.sh`'s source is in `jibjabjog/hermes-config` (§7);
 `local_llama_ping.sh` isn't tracked in any repo found on this box as of this
 writing — treat that one as a reproducibility gap.
@@ -764,11 +983,13 @@ values — don't just trust that the script ran without error.
 
 ```bash
 systemctl --user status hermes-gateway.service   # active (running)
-curl -s localhost:45072/health                   # the local fallback model (Inky)
-hermes fallback list                             # confirms qwen35-tiny is the live fallback target
+systemctl --user status llama-router.service     # active (running) -- gemma
+curl -s localhost:45072/health                   # Inky (auxiliary tasks + health beacon)
+curl -s localhost:8080/v1/models                 # the router -- gemma should be listed
+hermes fallback list                             # confirms gemma is the live fallback target
 gh auth status                                    # bot account logged in
 tailscale status                                  # this box + Supabase reachable
-hermes cron list                                  # all 3 jobs present, "enabled"
+hermes cron list                                  # all 4 jobs present, "enabled"
 hermes cron run <job-id>                          # force one job now, then check its log
 ```
 
@@ -781,22 +1002,77 @@ end, not just that credentials are present:
 - **Telegram:** force-run `local-llama-ping` (`hermes cron run <job-id>`) and
   confirm a message actually arrives in the chat you set as
   `TELEGRAM_HOME_CHANNEL`.
+- **The gemma fallback, for real:** don't just trust `hermes fallback list`
+  — §6 and §9's own history is a warning that "looks configured" and "works"
+  are different things on this box specifically. Confirm the cache is
+  actually being reused (the two-command test at the end of §6), not just
+  that the process is up.
 
 ---
 
 ## Known version drift (as of this write-up)
 
 Installed Hermes is **0.20.5**, ~71 commits behind the `main` branch's
-**0.20.6** (released 2026-08-27). Features documented upstream but not
-present in this build: Bot Mode, wake-word voice, Pets/Petdex, an active
-Mixture-of-Agents preset, the desktop app (N/A on a headless server anyway),
-Subscription Proxy/Nous Portal, a configured TTS pipeline (Whisper STT is
-present; TTS isn't), `/loop` recurring loops (this box uses its own cron
-ticker instead, §7), external memory providers (Honcho/Mem0 — only built-in
-SQLite memory is used), Checkpoints v2/rollback, image generation input, and
-multi-agent Kanban orchestration (the DB table exists but nothing populates
-it). None of these are bugs in the rebuild above — they're just not part of
-what this deployment currently uses.
+**0.20.6** (released 2026-08-27). None of what follows is a bug in the
+rebuild above — it's just what this specific deployment does and doesn't
+use, broken out by *why* rather than dumped in one list, since that list
+turned out to have two outright errors in it (corrected below).
+
+**Two corrections to an earlier version of this section** — checked
+against the live config and process state rather than assumed:
+- **Voice (STT/TTS) is fully configured, not absent.** Speech-to-text
+  (`faster-whisper`, local) and text-to-speech (Piper, local) are both
+  installed and wired up — see §8's Telegram section below for the actual
+  setup and a functional test. This deployment talks back.
+- **Checkpoints v2 is enabled and in active use, not "not referenced."**
+  `checkpoints.enabled: true` in `config.yaml`, and
+  `~/.hermes/checkpoints/store` is a real, actively-updated shadow git repo
+  — Hermes snapshots the working directory before `write_file`/`patch`/
+  `terminal` calls so `/rollback` has something to restore. Run `hermes
+  checkpoints status` to see its size and what's tracked.
+
+**Genuinely not configured here** — available upstream, not turned on:
+- **Bot Mode** — named specialist bots with persistent chats/routines/group
+  chats/`@mentions`. This box runs one plain Hermes profile, not a bot
+  roster.
+- **Mixture-of-Agents (MoA) preset** — `hermes moa` lets you define a named
+  preset that fans one prompt out to several reference models and
+  aggregates the result; none configured here (and would be a poor fit for
+  a CPU-only box regardless — each MoA call is *N* model calls, not one).
+- **Subscription Proxy / Nous Portal** — a paid, zero-config alternative to
+  this box's per-service setup (OpenRouter key, `gh` auth, Google OAuth,
+  etc.): one OAuth login covers a model provider plus web search, image
+  generation, TTS, and browser automation together. Not used here because
+  the per-service path this guide walks through is free.
+- **External memory providers (Honcho, Mem0, and six others)** — plugin
+  backends for cross-session user modeling beyond Hermes's built-in
+  `MEMORY.md`/`USER.md` system. `memory.provider: ''` here — built-in
+  memory only.
+- **Image *generation*** (FAL.ai-backed, text-to-image output) — a separate
+  tool from the vision *input* this box does have configured
+  (`auxiliary.vision.model`, used to actually look at images sent to it).
+  Generation isn't enabled; understanding images sent to the bot already
+  works.
+- **Multi-agent Kanban orchestration** — a board UI for fanning a task out
+  across multiple agent workers. `delegation.orchestrator_enabled: true` is
+  set (the underlying single-level delegation feature works), but nothing
+  populates `~/.hermes/kanban.db` — this deployment hasn't set up
+  multi-agent task boards.
+
+**Not applicable to a headless server, not really "missing":**
+- **Wake word** ("Hey Hermes" hands-free voice trigger) and **Pets/Petdex**
+  (animated mascots) — both are CLI/TUI/desktop-app UI features. There's no
+  local microphone or window to speak to or show a mascot in on a
+  server you only reach over SSH/Telegram.
+- **The desktop app itself** — same reason.
+- **`/loop` recurring loops** — worth clarifying rather than filing next to
+  the others: `/loop` and this box's cron jobs (§7) aren't really
+  alternatives for the same job. `/loop` is *session-scoped* — "keep
+  polling this while my current conversation is open" — and the docs
+  themselves say to use cron instead for anything that needs to run
+  unattended, overnight, surviving restarts. This box's Freerouter/
+  llama-ping/backup jobs are exactly that kind of unattended work, so cron
+  was always the right tool here, not a workaround for a missing feature.
 
 ---
 
